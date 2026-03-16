@@ -7,6 +7,8 @@ Targeted repair currently supports:
 - non-monotonic DTS written to the muxer
 - Opus packet-header parsing errors
 - HEVC decode errors such as frame RPS/NALU corruption (re-encode repair)
+- audio decode corruption patterns such as AC3 block/frame/coupling errors
+  (audio-only repair: copy video, re-encode audio)
 
 Background:
 I encountered these issues after editing videos with LosslessCut and enabling
@@ -31,6 +33,7 @@ History:
 - v0.4 2026-03-15 Reuse a single *.fixed target during fallback.
 - v0.5 2026-03-15 Code cleanup and report wording normalization.
 - v0.6 2026-03-16 Header and help reworked, added HEVC decode errors.
+- v0.7 2026-03-16 Added audio decode auto-repair triggering and audio-only repair path.
 """
 
 from __future__ import annotations
@@ -102,6 +105,12 @@ HEVC_REPAIR_PATTERNS = (
     "skipping invalid undecodable nalu",
 )
 
+AUDIO_DECODE_REPAIR_PATTERNS = (
+    "error decoding the audio block",
+    "corrupt decoded frame",
+    "invalid coupling range",
+)
+
 MAX_AUTO_FIX_ATTEMPTS = 1
 
 
@@ -139,7 +148,7 @@ def parse_args() -> argparse.Namespace:
     description = (
         f"{blue_bold}Video integrity checker with targeted auto-repair.{reset}\n"
         "Scan video files using ffprobe/ffmpeg. Currently repairs DTS-to-muxer, Opus packet-header issues,\n"
-        "and some HEVC decode errors."
+        "some HEVC decode errors, and audio decode corruption (audio-only repair)."
     )
     parser = argparse.ArgumentParser(
         description=description,
@@ -179,8 +188,8 @@ def parse_args() -> argparse.Namespace:
         "--auto-fix-dts",
         dest="auto_fix",
         action="store_true",
-        help=("Attempt repair for DTS-to-muxer and Opus packet-header issues."
-              "Tries one remux first, then re-encodes if needed."),
+        help=("Attempt repair for DTS-to-muxer, Opus packet-header, HEVC decode, and audio decode issues. "
+              "Tries one remux first, then uses targeted re-encode fallback if needed."),
     )
     parser.add_argument(
         "--inplace",
@@ -306,6 +315,8 @@ def check_with_ffmpeg_decode(path: Path) -> tuple[list[str], list[str]]:
     ]
     warnings = collect_pattern_lines(text, WARN_PATTERNS)
     warnings.extend(muxer_dts_warnings)
+    # Avoid double-counting the same line as both error and warning.
+    warnings = [line for line in warnings if line not in errors]
 
     # Non-zero return code can still indicate runtime failure.
     if proc.returncode != 0 and not errors:
@@ -341,6 +352,8 @@ def has_repairable_issue(result: CheckResult) -> bool:
             return True
         if any(p in lower for p in HEVC_REPAIR_PATTERNS):
             return True
+        if any(p in lower for p in AUDIO_DECODE_REPAIR_PATTERNS):
+            return True
     return False
 
 
@@ -358,6 +371,15 @@ def has_hevc_repair_issue(result: CheckResult) -> bool:
     for line in all_lines:
         lower = line.lower()
         if any(p in lower for p in HEVC_REPAIR_PATTERNS):
+            return True
+    return False
+
+
+def has_audio_decode_repair_issue(result: CheckResult) -> bool:
+    all_lines = result.errors + result.warnings
+    for line in all_lines:
+        lower = line.lower()
+        if any(p in lower for p in AUDIO_DECODE_REPAIR_PATTERNS):
             return True
     return False
 
@@ -636,6 +658,78 @@ def reencode_keep_codec_family(
     return True, logs
 
 
+def reencode_audio_keep_video(
+    input_path: Path,
+    output_path: Path,
+    *,
+    prefer_non_opus_audio: bool = False,
+) -> tuple[bool, list[str]]:
+    profile, read_err = read_source_profile(input_path)
+    if read_err:
+        return False, [f"Audio-only repair could not read source profile: {read_err}"]
+
+    a_args, a_note = pick_audio_encoder(
+        profile,
+        output_suffix=output_path.suffix.lower(),
+        prefer_non_opus=prefer_non_opus_audio,
+    )
+    tmp_name = f".{output_path.stem}.dtsfix.audiofix.{os.getpid()}{output_path.suffix}"
+    tmp_path = output_path.with_name(tmp_name)
+    logs = [
+        "Starting audio-only repair (copy video stream, re-encode audio stream).",
+        f"source: {input_path.name}",
+        f"target: {output_path.name}",
+        f"source bitrate audio: {profile.audio_bitrate or 'unknown'} bps",
+        f"Audio: {a_note}",
+    ]
+
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "warning",
+        "-i",
+        str(input_path),
+        "-map",
+        "0",
+        "-map",
+        "-0:d?",
+        "-map",
+        "-0:t?",
+        "-c:v",
+        "copy",
+        "-c:a",
+        *a_args,
+        "-c:s",
+        "copy",
+    ]
+    if output_path.suffix.lower() in {".mp4", ".m4v", ".mov"}:
+        cmd.extend(["-movflags", "+faststart"])
+    cmd.extend(["-y", str(tmp_path)])
+
+    proc = run_cmd(cmd)
+    text = "\n".join([proc.stdout or "", proc.stderr or ""]).strip()
+    if proc.returncode != 0:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        details = collect_pattern_lines(text, ERROR_PATTERNS)[:1]
+        tail = f": {details[0]}" if details else ""
+        logs.append(f"audio-only repair failed (ffmpeg rc={proc.returncode}{tail})")
+        return False, logs
+
+    if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+        tmp_path.unlink(missing_ok=True)
+        logs.append("audio-only repair failed (empty output file)")
+        return False, logs
+
+    switched, switch_err = replace_target_file(tmp_path, output_path)
+    if not switched:
+        logs.append(f"audio-only repair failed ({switch_err})")
+        return False, logs
+
+    logs.append("audio-only repair complete, recheck follows.")
+    return True, logs
+
+
 def analyze_dts_timeline(path: Path, max_examples: int = 5) -> list[str]:
     cmd = [
         "ffprobe",
@@ -711,6 +805,7 @@ def check_file(
         issue_still_present = has_repairable_issue(result)
         saw_opus_packet_header_issue = saw_opus_packet_header_issue or has_opus_packet_header_issue(result)
         saw_hevc_repair_issue = has_hevc_repair_issue(result)
+        saw_audio_decode_repair_issue = has_audio_decode_repair_issue(result)
         if fast or not auto_fix or not issue_still_present:
             if auto_fix and attempt > 0:
                 result.fix_logs.append(f"auto-fix successful after attempt {attempt}.")
@@ -727,6 +822,20 @@ def check_file(
             if reencode_ok:
                 work_path = fallback_target
                 result.fix_logs.append("recheck after HEVC re-encode repair.")
+                result.errors, result.warnings, result.ok = run_checks_for_path(work_path, fast)
+            break
+        if saw_audio_decode_repair_issue:
+            result.fix_logs.append("auto-fix: audio decode issue detected, using audio-only repair.")
+            fallback_target = work_path if (inplace or work_path != path) else next_fixed_path(path)
+            reencode_ok, reencode_logs = reencode_audio_keep_video(
+                work_path,
+                fallback_target,
+                prefer_non_opus_audio=saw_opus_packet_header_issue,
+            )
+            result.fix_logs.extend(reencode_logs)
+            if reencode_ok:
+                work_path = fallback_target
+                result.fix_logs.append("recheck after audio-only repair.")
                 result.errors, result.warnings, result.ok = run_checks_for_path(work_path, fast)
             break
         if attempt >= MAX_AUTO_FIX_ATTEMPTS:
