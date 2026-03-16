@@ -6,6 +6,8 @@ Targeted repair currently supports:
 - non-monotonic DTS written to the muxer
 - Opus packet-header parsing errors
 - HEVC decode errors such as frame RPS/NALU corruption (re-encode repair)
+- audio decode corruption patterns such as AC3 block/frame/coupling errors
+  (audio-only repair: copy video, re-encode audio)
 
 ## Background
 I encountered these issues after editing videos with LosslessCut and enabling
